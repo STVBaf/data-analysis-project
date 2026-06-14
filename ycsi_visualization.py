@@ -30,8 +30,12 @@ plt.rcParams["figure.dpi"] = 120
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
+CLEAN_DIR = DATA_DIR / "clean"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# 真实数据基准年（与 clean_data.py 的 BASE_YEAR 一致）。
+BASE_YEAR = 2021
 
 CITY_COORDS = {
     "北京": (116.4074, 39.9042),
@@ -85,6 +89,10 @@ WEIGHTS = {
     "commute": 0.10,
 }
 
+# YCSI 展示分区间：避免首尾城市被钉死为 0/100，体现"相对指数"含义。
+SCORE_FLOOR = 40.0
+SCORE_CEIL = 95.0
+
 CHART_PLAN = [
     {
         "chart": "全国城市生存力指数点状热力图",
@@ -133,6 +141,12 @@ CHART_PLAN = [
         "question": "推荐不同类型青年适合的城市类别",
         "fields": "five YCSI dimensions",
         "output": "08_city_clusters.png",
+    },
+    {
+        "chart": "商品房租金月度趋势图",
+        "question": "各城市租金随时间的变化（2018-2025）",
+        "fields": "date, city, rent_per_sqm",
+        "output": "09_rent_trend.png",
     },
 ]
 
@@ -243,80 +257,58 @@ def load_base_data() -> pd.DataFrame:
 
 
 def add_job_and_rent_metrics(metrics: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """接入真实薪资/租金/就业数据（data/clean/city_snapshot.csv）。
+
+    数据来源：
+      - 薪资 avg_salary：城镇非私营单位在岗职工平均工资 / 12（2021，元/月）
+      - 租金 avg_rent：商品房平均出租价格 × 50㎡（2021，元/月）
+      - 岗位规模 job_count：城镇非私营单位从业人员数（万人，真实就业规模代理）
+    若快照缺失则回退到宏观指标估算（保留兼容）。
+    """
     metrics = metrics.copy()
     source_notes: list[str] = []
-    rng = np.random.default_rng(42)
 
-    job_path = DATA_DIR / "job_data.csv"
-    if job_path.exists():
-        job_df = read_csv_fallback(job_path)
-        job_df.columns = [str(column).strip().lower() for column in job_df.columns]
-        if {"city", "salary_min", "salary_max"}.issubset(job_df.columns):
-            job_df["salary_min"] = pd.to_numeric(job_df["salary_min"], errors="coerce")
-            job_df["salary_max"] = pd.to_numeric(job_df["salary_max"], errors="coerce")
-            job_df["avg_salary"] = job_df[["salary_min", "salary_max"]].mean(axis=1)
-            title_col = "job_title" if "job_title" in job_df.columns else "city"
-            job_city = (
-                job_df.groupby("city", as_index=False)
-                .agg(avg_salary=("avg_salary", "mean"), job_count=(title_col, "count"))
-            )
-            metrics = metrics.merge(job_city, on="city", how="left")
-            source_notes.append("招聘数据：使用 data/job_data.csv。")
-        else:
-            source_notes.append("招聘数据：job_data.csv 字段不完整，改用演示估算。")
+    snap_path = CLEAN_DIR / "city_snapshot.csv"
+    if snap_path.exists():
+        snap = read_csv_fallback(snap_path)
+        snap.columns = [str(c).strip() for c in snap.columns]
+        cols = {
+            "city": "city",
+            "avg_salary_month": "avg_salary",
+            "rent_month_est": "avg_rent",
+            "rent_income_ratio": "rent_income_ratio",
+            "urban_employment_wan": "urban_employment_wan",
+        }
+        snap = snap[list(cols.keys())].rename(columns=cols)
+        for col in ("avg_salary", "avg_rent", "rent_income_ratio", "urban_employment_wan"):
+            snap[col] = pd.to_numeric(snap[col], errors="coerce")
+        # 就业人数（万人）作为真实"岗位规模"代理，替代原模拟 job_count
+        snap["job_count"] = (snap["urban_employment_wan"] * 10000).round(0).astype("Int64")
+        snap = snap.drop(columns=["urban_employment_wan"])
 
-    if "avg_salary" not in metrics.columns or metrics["avg_salary"].isna().all():
-        gdp_n = minmax(metrics["gdp"])
-        income_n = minmax(metrics["disposable_income"])
-        tertiary_n = minmax(metrics["tertiary_industry_pct"])
-        university_n = minmax(metrics["university_count"])
-        metrics["avg_salary"] = (
-            metrics["disposable_income"]
-            / 12
-            * (1.02 + 0.22 * gdp_n + 0.12 * tertiary_n + rng.normal(0, 0.025, len(metrics)))
-        ).round(0)
-        metrics["job_count"] = (
-            850
-            + 5200
-            * (0.42 * gdp_n + 0.25 * income_n + 0.20 * university_n + 0.13 * tertiary_n)
-            + rng.normal(0, 120, len(metrics))
-        ).round(0).clip(lower=300).astype(int)
-        source_notes.append("招聘数据：未发现可用 job_data.csv，使用宏观指标生成演示薪资/岗位数。")
+        metrics = metrics.merge(snap, on="city", how="left")
+        source_notes.append(
+            f"薪资数据：城镇非私营单位在岗职工平均工资/12（{BASE_YEAR}，真实，data/job_data.csv）。"
+        )
+        source_notes.append(
+            f"租金数据：商品房平均出租价格×50㎡（{BASE_YEAR}，真实，data/rent_data.xlsx）。"
+        )
+        source_notes.append(
+            "岗位规模：以城镇非私营单位从业人员数代理（真实就业规模）。"
+        )
     else:
-        metrics["avg_salary"] = metrics["avg_salary"].fillna(metrics["avg_salary"].median())
-        metrics["job_count"] = metrics["job_count"].fillna(metrics["job_count"].median()).astype(int)
+        source_notes.append("未发现 city_snapshot.csv，请先运行 clean_data.py 生成清洗数据。")
+        raise FileNotFoundError(f"缺少清洗数据: {snap_path}，请先运行 python clean_data.py")
 
-    rent_path = DATA_DIR / "rent_data.csv"
-    if rent_path.exists():
-        rent_df = read_csv_fallback(rent_path)
-        rent_df.columns = [str(column).strip().lower() for column in rent_df.columns]
-        if {"city", "rent"}.issubset(rent_df.columns):
-            rent_df["rent"] = pd.to_numeric(rent_df["rent"], errors="coerce")
-            rent_city = rent_df.groupby("city", as_index=False).agg(avg_rent=("rent", "mean"))
-            metrics = metrics.merge(rent_city, on="city", how="left")
-            source_notes.append("租房数据：使用 data/rent_data.csv。")
-        else:
-            source_notes.append("租房数据：rent_data.csv 字段不完整，改用演示估算。")
+    # 兜底：极个别缺失用中位数填充，保证后续计算不崩
+    for col in ("avg_salary", "avg_rent", "rent_income_ratio"):
+        if metrics[col].isna().any():
+            metrics[col] = metrics[col].fillna(metrics[col].median())
+            source_notes.append(f"提示：{col} 存在缺失，已用中位数填充。")
+    metrics["job_count"] = (
+        metrics["job_count"].fillna(metrics["job_count"].median()).astype(int)
+    )
 
-    if "avg_rent" not in metrics.columns or metrics["avg_rent"].isna().all():
-        gdp_n = minmax(metrics["gdp"])
-        income_n = minmax(metrics["disposable_income"])
-        metro_n = minmax(metrics["metro_lines"])
-        pop_n = minmax(metrics["population"])
-        rent_ratio = (
-            0.22
-            + 0.22 * income_n
-            + 0.10 * gdp_n
-            + 0.05 * pop_n
-            - 0.06 * metro_n
-            + rng.normal(0, 0.018, len(metrics))
-        ).clip(0.18, 0.62)
-        metrics["avg_rent"] = (metrics["avg_salary"] * rent_ratio).round(0)
-        source_notes.append("租房数据：未发现可用 rent_data.csv，使用宏观指标生成演示租金。")
-    else:
-        metrics["avg_rent"] = metrics["avg_rent"].fillna(metrics["avg_rent"].median())
-
-    metrics["rent_income_ratio"] = metrics["avg_rent"] / metrics["avg_salary"]
     return metrics, source_notes
 
 
@@ -331,8 +323,10 @@ def calculate_ycsi(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     metrics["rent_pressure"] = minmax(metrics["rent_income_ratio"])
 
-    poi_per_pop = metrics[POI_COLS].div(metrics["population"], axis=0)
-    poi_scaled = poi_per_pop.apply(minmax)
+    # 生活便利度按 POI 绝对总量衡量（可达的选择多寡），而非人均。
+    # 人均会惩罚大城市规模优势（如北京餐饮5591家被巨大人口稀释为人均垫底），
+    # 与"城市能提供多少便利"的直觉相悖。总量同时避免了人口口径问题。
+    poi_scaled = metrics[POI_COLS].apply(minmax)
     poi_weights = pd.Series(
         {
             "subway": 0.18,
@@ -354,8 +348,9 @@ def calculate_ycsi(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         + 0.15 * minmax(metrics["tertiary_industry_pct"])
     )
 
+    # 通勤压力以城区就业规模为主，而非户籍人口（避免郊县人口虚高拉满压力）。
     commute_raw = (
-        0.42 * minmax(metrics["population"])
+        0.42 * minmax(metrics["job_count"])
         + 0.24 * minmax(metrics["gdp"])
         + 0.14 * minmax(metrics["avg_rent"])
         - 0.20 * minmax(metrics["metro_lines"])
@@ -369,7 +364,15 @@ def calculate_ycsi(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         - WEIGHTS["rent"] * metrics["rent_pressure"]
         - WEIGHTS["commute"] * metrics["commute_score"]
     )
-    metrics["ycsi"] = (minmax(metrics["ycsi_raw"]) * 100).round(2)
+    # 线性映射到 [SCORE_FLOOR, SCORE_CEIL]，避免 min-max 把首尾城市钉死为 0/100。
+    # YCSI 是相对指数：最低城市仍有基础分，最高城市不取满分。
+    raw = metrics["ycsi_raw"]
+    span = raw.max() - raw.min()
+    if pd.isna(span) or span == 0:
+        scaled = pd.Series(np.full(len(raw), (SCORE_FLOOR + SCORE_CEIL) / 2), index=raw.index)
+    else:
+        scaled = SCORE_FLOOR + (raw - raw.min()) / span * (SCORE_CEIL - SCORE_FLOOR)
+    metrics["ycsi"] = scaled.round(2)
     metrics["rank"] = metrics["ycsi"].rank(ascending=False, method="first").astype(int)
     metrics["rent_friendliness"] = 1 - metrics["rent_pressure"]
     metrics["commute_friendliness"] = 1 - metrics["commute_score"]
@@ -384,8 +387,8 @@ def plot_ycsi_ranking(metrics: pd.DataFrame) -> Path:
     ax.barh(plot_df["city"], plot_df["ycsi"], color=colors, edgecolor="white", linewidth=0.8)
     for _, row in plot_df.iterrows():
         ax.text(row["ycsi"] + 1.0, row["city"], f"{row['ycsi']:.1f}", va="center", fontsize=9)
-    ax.set_xlim(0, 108)
-    ax.set_xlabel("YCSI 综合得分（0-100）")
+    ax.set_xlim(0, SCORE_CEIL + 10)
+    ax.set_xlabel(f"YCSI 综合得分（相对指数，{SCORE_FLOOR:.0f}-{SCORE_CEIL:.0f}）")
     ax.set_title("15 城青年城市生存力指数排名")
     ax.grid(axis="x", alpha=0.25)
     ax.spines[["top", "right", "left"]].set_visible(False)
@@ -569,7 +572,7 @@ def plot_poi_stack(metrics: pd.DataFrame, poi_scaled: pd.DataFrame) -> Path:
     poi_components = poi_components.rename(columns=display_names)
     fig, ax = plt.subplots(figsize=(11, 7))
     poi_components.plot(kind="bar", stacked=True, ax=ax, colormap="tab20c", width=0.72)
-    ax.set_ylabel("按人口标准化后的 POI 综合量")
+    ax.set_ylabel("POI 综合量（按总量标准化）")
     ax.set_xlabel("城市")
     ax.set_title("生活便利 POI 构成对比")
     ax.grid(axis="y", alpha=0.22)
@@ -693,6 +696,34 @@ def plot_city_clusters(metrics: pd.DataFrame) -> tuple[Path, pd.DataFrame]:
     return figure_path, summary
 
 
+def plot_rent_trend(metrics: pd.DataFrame) -> Path | None:
+    """商品房租金 2018-2025 月度趋势（真实时间序列，补足时间维度）。"""
+    panel_path = CLEAN_DIR / "rent_panel.csv"
+    if not panel_path.exists():
+        return None
+    panel = read_csv_fallback(panel_path)
+    panel["date"] = pd.to_datetime(panel["date"], errors="coerce")
+    panel["rent_per_sqm"] = pd.to_numeric(panel["rent_per_sqm"], errors="coerce")
+    panel = panel.dropna(subset=["date", "rent_per_sqm"])
+
+    # 高亮 YCSI 前 6 城，其余城市淡灰背景
+    top_cities = metrics.sort_values("ycsi", ascending=False)["city"].head(6).tolist()
+    fig, ax = plt.subplots(figsize=(11, 6.5))
+    for city, grp in panel.groupby("city"):
+        grp = grp.sort_values("date")
+        if city in top_cities:
+            ax.plot(grp["date"], grp["rent_per_sqm"], linewidth=2, label=city, zorder=3)
+        else:
+            ax.plot(grp["date"], grp["rent_per_sqm"], linewidth=0.8,
+                    color="#cccccc", alpha=0.6, zorder=1)
+    ax.set_xlabel("时间")
+    ax.set_ylabel("商品房平均出租价格（元/㎡·月）")
+    ax.set_title("15 城商品房租金月度趋势（2018-2025，高亮 YCSI 前 6）")
+    ax.grid(alpha=0.22)
+    ax.legend(title="YCSI 前 6 城", frameon=False, loc="upper left", ncol=2)
+    return save_figure("09_rent_trend.png")
+
+
 def export_scores(metrics: pd.DataFrame) -> Path:
     columns = [
         "city",
@@ -740,6 +771,10 @@ def run() -> None:
     cluster_path, cluster_summary = plot_city_clusters(metrics)
     generated.append(cluster_path)
     generated.append(export_cluster_summary(cluster_summary))
+
+    trend_path = plot_rent_trend(metrics)
+    if trend_path is not None:
+        generated.append(trend_path)
 
     print("数据来源说明：")
     for note in source_notes:

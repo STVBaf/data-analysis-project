@@ -10,5 +10,6 @@
 | 生活便利 POI 构成图 | 城市日常生活便利度差异 | subway, hospital, park, mall, restaurant, library, gym | 06_poi_convenience_stack.png |
 | 指标相关性热力图 | 薪资、租金、生活便利、就业机会之间的关系 | salary, rent, job count, YCSI dimensions | 07_metric_correlation_heatmap.png |
 | K-Means 城市聚类图 | 推荐不同类型青年适合的城市类别 | five YCSI dimensions | 08_city_clusters.png |
+| 商品房租金月度趋势图 | 各城市租金随时间的变化（2018-2025） | date, city, rent_per_sqm | 09_rent_trend.png |
 
 可选扩展：通勤-租房地图需要 `rent_data.csv` 中的区县/房源级租金、经纬度和就业中心数据；文本词云需要 `city_text.csv` 的 `city,text` 评论数据。
